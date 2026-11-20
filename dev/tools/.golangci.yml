@@ -1,0 +1,118 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# golangci-lint v2 config for squall.
+#
+# Run with:   dev/tools/lint-go
+# Auto-fix:   dev/tools/lint-go --fix
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # Bug-finders we never want to silence.
+    - errcheck       # unchecked errors
+    - govet          # core vet rules
+    - ineffassign    # ineffectual assignments
+    - staticcheck    # massive bug+style ruleset
+    - unused         # dead code
+
+    # Quality-of-life.
+    - misspell       # common typos in identifiers/comments
+    - unconvert      # unnecessary type conversions
+    - unparam        # unused function parameters
+    - gocritic       # opinionated extra rules; many useful, low false-positive
+
+    # Complexity ratchets (initialized tight on greenfield code).
+    - funlen
+    - gocognit
+
+    # Compliance.
+    - goheader       # enforces the Apache 2.0 boilerplate on every .go file
+
+    # Security.
+    - gosec          # OWASP-style checks (nosec via // #nosec)
+
+  exclusions:
+    generated: lax
+    paths:
+      - (^|/)\.claude/
+      - (^|/)\.worktrees/
+    presets:
+      - common-false-positives
+      - legacy
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - funlen
+          - gosec
+          - unparam
+
+  settings:
+    errcheck:
+      exclude-functions:
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+        - (*os.File).Close
+        - os.Remove
+    funlen:
+      lines: 120
+      statements: 70
+      ignore-comments: true
+    gocognit:
+      min-complexity: 30
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - commentFormatting
+    gosec:
+      excludes:
+        - G104
+    goheader:
+      template: |-
+        Copyright {{ YEAR-RANGE }} Google LLC
+
+        Licensed under the Apache License, Version 2.0 (the "License");
+        you may not use this file except in compliance with the License.
+        You may obtain a copy of the License at
+
+            http://www.apache.org/licenses/LICENSE-2.0
+
+        Unless required by applicable law or agreed to in writing, software
+        distributed under the License is distributed on an "AS IS" BASIS,
+        WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        See the License for the specific language governing permissions and
+        limitations under the License.
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/go-steer/squall
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
