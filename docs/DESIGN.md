@@ -7,7 +7,7 @@
 ## TL;DR
 
 1. **Close the answer leak at the injection layer.** When an autonomous SRE agent (`shipmind` / `core-agent`) investigates an incident with cluster-wide read access, custom-resource chaos operators hand it the diagnosis via core `v1` `Event`s and per-pod shadow objects. `squall` injects runtime faults with **zero per-fault Kubernetes objects and zero injector Events**, holding fault kind/target (`K`) and parameters (`F`) to zero under wildcard-read RBAC (`R`).
-2. **Split execution into an external deterministic engine (`squall`) and a self-reverting node agent (`squalld`).** `squall` runs outside the target cluster so its audit stream cannot be read via `pods/log`. Pod loss is a plain Kubernetes `pods delete`. Network delay, packet loss, L3/L4 partition, container kill, and CPU/memory burn run through `squalld` — a DaemonSet (`hostPID`, four capabilities, no container runtime socket, no Kubernetes API token) that verifies `purser` mTLS + Ed25519-signed command leases, arms a node-local `tmpfs` timer, and backs partitions with `nftables` kernel set timeouts.
+2. **Split execution into a multi-cluster external engine (`squall`) and a zero-listen, self-reverting node agent (`squalld`).** One `squall` management plane serves *N* target clusters from outside those clusters so its audit stream is unreachable via target `pods/log`. Pod loss is a plain Kubernetes `pods delete`. Network delay, packet loss, L3/L4 partition, container kill, and CPU/memory burn run through `squalld` — a DaemonSet (`hostPID`, four capabilities, no container runtime socket, no Kubernetes API token, **zero listening network ports**) that dials outbound over bi-directional gRPC + `purser` mTLS to `squall`'s management-cluster Internal L4 LoadBalancer, verifies Ed25519-signed command leases, arms a node-local `tmpfs` timer, and backs partitions with `nftables` kernel set timeouts.
 3. **One asynchronous protobuf Engine API backs CLI, MCP, and Go/Python SDKs.** `SubmitFault` returns a lease handle immediately without blocking on multi-minute settle probes; heartbeated, budgeted scenario sessions let multi-fault programs react to live cluster state and automatically reap every active fault if the caller crashes or misses a heartbeat.
 4. **Build `squall-agent` on `core-agent/v3` + `core-models` under four independence rules.** The engine imports zero LLM packages; audit ground truth comes strictly from confirmed engine state; fixed deterministic scenario packs run alongside LLM-chosen faults; and startup validation enforces model-family diversity against the SRE agent under test (for example, running Claude on `anthropic-vertex` when the subject runs Gemini on `vertex`).
 5. **Run agent-authored scenario code in network-fenced gVisor sandboxes (`sigs.k8s.io/agent-sandbox`).** Scenario programs compile and execute against prewarmed Go/Python SDK caches (~4s `go build`) with no Kubernetes API token and `NetworkPolicy` egress restricted exclusively to the `squall` Engine API and read-only arena metrics. Every fault still traverses `pkg/executor`.
@@ -59,7 +59,7 @@ Testing all 8 existing `kube-state` lookout-pack kinds one by one against `shipm
 
 1. **Separate public repository (`go-steer/squall`).** Leave `go-steer/simian-agent` intact for Chaos Mesh workflows and its `oracle_read` benchmark. Carry over proven non-Chaos-Mesh domain packages (`executor`, `arena`, `lease`, `probe`, `audit`, `kubestate`, `networkpolicy`) with attribution.
 2. **No Chaos Mesh dependency.** Use plain Kubernetes `pods delete` for pod loss, `squalld` for pod-netns and cgroup faults, protocol load generation for overload, `kube-state` synthesized/mutated objects for Kubernetes control-plane scenarios, and `network-policy` where policy visibility is the intended diagnosis.
-3. **Engine outside the target cluster.** Run `squall` off-cluster (or in a separate management cluster) so neither its state nor its audit stream is reachable via target-cluster `pods/log`. Timed network efficacy probes execute inside the target cluster on `squalld`.
+3. **Multi-target external engine + outbound `squalld` reverse streams.** Run one `squall` control plane outside the target clusters (serving *N* registered target clusters keyed on `(cluster_id, arena)`) so neither its state nor its audit stream is reachable via target-cluster `pods/log`. Each `squalld` pod dials outbound over bi-directional gRPC to `squall`'s Internal L4 LoadBalancer so target clusters expose zero inbound ports or Services; timed network efficacy probes execute inside each target cluster on `squalld`.
 4. **Leak bar at wildcard-read RBAC (`R`).** Presence of chaos infrastructure (`P`) is permitted; fault kind/target (`K`) and parameters (`F`) must be zero for an investigator able to read every Kubernetes resource kind and `pods/log`.
 5. **Unified protobuf Engine API + heartbeated sessions + SDKs.** One Engine API contract serves MCP tools and generated Go/Python SDKs so both declarative tool calls and imperative agent-written scenario scripts share identical safety, lease, and audit guarantees.
 6. **Agent on `core-agent/v3` + `core-models`, scenario code in `agent-sandbox` gVisor.** Build `squall-agent` on `github.com/go-steer/core-agent/v3` (`go-steer/mast` is frozen) and `github.com/go-steer/core-models`, enforce model-family diversity against the SUT, and execute scenario code in prewarmed gVisor sandboxes (never Yaegi).
@@ -90,7 +90,7 @@ We classify observable artifacts by what they reveal to an investigating SRE age
 | Ephemeral containers / pod-failure spec rewrites | `F`, `K` | `V` | Never used (`spec.ephemeralContainers` is immutable for pod life) |
 | Synthesized object names, labels, images | `P`, `K` | `V` | Neutral naming/labels; zero kind/action tokens in specs or images |
 | Controller & node-agent stdout (`pods/log`) | `F`, `K` | `V` (cluster-bound) | Engine runs off-cluster; `squalld` logs opaque `fault_id`s only |
-| Unauthenticated `pods/proxy` scraping of node agent | `F`, `K` | `R` (wildcard `get`) | `squalld` binds `127.0.0.1` under `pods/portforward` (or requires end-to-end `purser` client mTLS + Ed25519 signature over VPC) |
+| Unauthenticated `pods/proxy` or lateral pod scraping of node agent | `F`, `K` | `R` (wildcard `get`) | `squalld` opens **zero listening sockets** in normal operation (dials outbound bi-directional gRPC + `purser` mTLS to `squall`) |
 | GKE Cloud Audit Logs on `pods delete` | `P` (`squall` principal), target pod | GCP IAM `logging.viewer` | Accepted when subject lacks Cloud Logging IAM; documented under `T9` |
 
 ### Enforce zero K and F leak budget at wildcard-read RBAC {#LEAK-1}
@@ -122,17 +122,18 @@ Unit and integration test `T4` must assert across every driver (`podkill`, `squa
 
 ```mermaid
 flowchart LR
-  subgraph Control["Management Plane (Off-Cluster or Dedicated Management Cluster)"]
+  subgraph Control["Management Cluster (or Workstation)"]
     Agent["squall-agent<br/>(core-agent/v3 + core-models)"]
     Sandbox["squall-scenario-sandbox<br/>(agent-sandbox gVisor)"]
-    Engine["squall Engine<br/>(pkg/executor + leases + audit)"]
+    Engine["squall Engine<br/>(pkg/executor + multi-cluster hub)"]
+    ILB["Internal L4 LoadBalancer<br/>(VPC / PSC Ingress)"]
     Audit[("Audit Store &<br/>Scorecard")]
   end
 
-  subgraph Target["Target Kubernetes Cluster"]
+  subgraph Target["Target Kubernetes Cluster(s) (1..N, keyed by cluster_id)"]
     APIServer["Kubernetes API Server"]
     subgraph SquallSys["Namespace: squall-system"]
-      Squalld["squalld DaemonSet<br/>(hostPID, 4 caps, tmpfs lease, nftables)"]
+      Squalld["squalld DaemonSet<br/>(0 listen ports, 4 caps, tmpfs + nftables)"]
     end
     subgraph Arena["Arena Namespace (e.g. triage-lab)"]
       Workloads["Target Workloads & Services"]
@@ -146,9 +147,10 @@ flowchart LR
   Agent -->|"MCP / Engine API"| Engine
   Agent -->|"squall_run_scenario"| Sandbox
   Sandbox -->|"Session Token (Go/Python SDK)"| Engine
+  ILB --> Engine
   Engine -->|"Audit JSONL (off-cluster)"| Audit
   Engine -->|"pods delete / kube-state"| APIServer
-  Engine -->|"purser mTLS + Ed25519 Lease"| Squalld
+  Squalld -->|"Outbound bi-di gRPC (purser mTLS + Ed25519)"| ILB
   Squalld -->|"netns tc/nft, cgroup, probes"| Workloads
   Lookout -->|"Watches K8s & Metrics"| APIServer
   Lookout -->|"Opens Incident"| SRE
@@ -177,12 +179,13 @@ Every fault mutation — whether initiated from the `squall` CLI, an MCP tool ca
 
 No driver, CLI subcommand, or SDK endpoint may invoke `squalld` or mutate target-cluster resources outside `pkg/executor`.
 
-### Run the engine outside the target cluster {#ENG-2}
+### Run the engine outside target clusters as a multi-cluster hub {#ENG-2}
 
-`squall` runs outside the target cluster (on an operator workstation, CI runner, or separate management cluster), authenticating to the target Kubernetes API server with an explicit `--target-kubeconfig` and context (never ambient default context). Its target-cluster RBAC footprint consists strictly of:
-1. A read-only discovery `ClusterRole` for topology and steady-state prechecks.
-2. Per-arena `RoleBinding`s (supporting both Kubernetes `ServiceAccount` and cloud IAM / Workload Identity `User` subjects) granting `pods` `delete` and `kube-state` / `network-policy` verbs strictly inside opt-in arena namespaces.
-3. Reachability to `squalld` pods in `squall-system` via L4 TCP **`pods/portforward`** (`create` on `pods/portforward` in `squall-system`, which preserves end-to-end client mTLS and HTTP/2/gRPC and is never granted by wildcard `get`/`list`/`watch` `R` roles — unlike `pods/proxy`, which terminates TLS at `kube-apiserver` and strips client certificates) or direct private VPC mTLS.
+One `squall` engine instance runs outside the target clusters (in a dedicated `squall` management cluster, or on a workstation/CI runner) and manages **one or more named target clusters** configured in an explicit target registry (`clusters[cluster_id] -> {kubeconfig, context, allowed_arenas, node_tier_enabled}` — never an ambient default kubeconfig context). All executor safety gates, concurrency limits, cooldown timers, and active lease records are keyed on **`(cluster_id, arena)`** from day one so `triage-lab` arenas across `stage`, `canary`, and `dev` clusters never collide:
+
+1. **Outbound node-agent hub via Internal L4 LoadBalancer:** In the management cluster, `squall` sits behind a single standard Kubernetes **Internal L4 `LoadBalancer` Service** (optionally published via Private Service Connect across disjoint or CIDR-overlapping VPCs). Because `squalld` streams are stateful, `squall` runs active/passive leader election and reports HTTP `Ready` to the Internal L4 LoadBalancer health check **only on the active leader replica**, guaranteeing that all `squalld` streams and Engine API requests land on the authoritative lease coordinator (with automatic stream reconnect on failover).
+2. **Zero target-cluster ingress:** Each `squalld` pod dials outbound to `squall`'s Internal L4 LoadBalancer VIP (or the Docker host gateway on `kind`). Target clusters expose **zero LoadBalancers, zero Kubernetes `Service`s, and zero listening ports** for `squalld` (an opt-in `--dev-loopback-listen` mode on `127.0.0.1` + `pods/portforward` exists solely for standalone laptop-to-cloud testing when no management cluster is deployed).
+3. **Minimal target-cluster RBAC:** Per target cluster, `squall` holds only a read-only discovery `ClusterRole` for topology/steady-state prechecks and per-arena `RoleBinding`s (`ServiceAccount` or Workload Identity `User` subjects) granting `pods` `delete` and `kube-state` / `network-policy` verbs inside opt-in arena namespaces (no `pods/proxy` or `pods/portforward` needed in normal operation).
 
 ### Inject pod loss via plain Kubernetes pod deletion {#ENG-3}
 
@@ -234,12 +237,12 @@ The remaining three `k8s-lookout` wire scenarios — `node-failure` (`objectstat
 - **No host container runtime socket** (`/run/containerd/containerd.sock` is never mounted), eliminating node-wide image pull or arbitrary privileged container spawn primitives.
 - Writable host `/sys/fs/cgroup` mount (for cgroup v2 burner subprocess attachment), read-only root filesystem (`distroless/static-debian12` using pure-Go netlink), and a dedicated `tmpfs` mount at `/run/squalld` (`size=16Mi`).
 
-### Authenticate squall-to-squalld transport with purser mTLS and Ed25519 command leases {#NODE-2}
+### Connect squalld outbound over bi-directional gRPC with per-cluster purser mTLS and Ed25519 command leases {#NODE-2}
 
-Because Kubernetes RBAC wildcard `get` (`*`) matches `pods/proxy`, an SRE agent with broad read permissions could attempt HTTP requests to `squalld`'s PodIP through the API server proxy. `squalld` closes this completely with network binding and two independent cryptographic layers:
+In normal operation, `squalld` **never calls `net.Listen`** (`0` open ports in the target cluster), eliminating Kubernetes `pods/proxy` scraping, per-cluster LoadBalancer provisioning, and DaemonSet random-pod L4 routing in one stroke:
 
-1. **Loopback bind under `pods/portforward` + transport mTLS via `go-steer/purser` (`v0.5.0`):** In `pods/portforward` mode (`#ENG-2`), `squalld` binds strictly to `127.0.0.1:<port>`, so `pods/proxy` (which dials `PodIP:<port>`) fails immediately with `ECONNREFUSED`. In both `pods/portforward` and direct VPC modes, `squalld` terminates end-to-end TLS using `purser/authn/mtls` (`mtls.NewPKI` against a dedicated controller CA admitting `mtls.MatchCertDNSSAN("squall-controller")` with `CertificateFileSource` + `CertPoolFileSource` hot-reload, or federated `mtls.NewSPIFFE`), so any non-controller connection — including `kube-apiserver`'s client-cert-less `pods/proxy` backend dial — fails at the TLS handshake and receives zero HTTP metadata.
-2. **Per-command Ed25519 lease envelope:** `purser` authenticates connections rather than payload leases. Exclusively inside `squall`'s `pkg/executor` — after arena and safety checks pass — the executor signs a canonical command envelope with an Ed25519 private key (`crypto/ed25519`; public key mounted read-only in `squalld`):
+1. **Outbound bi-directional gRPC + per-cluster `purser` mTLS (`v0.5.0`):** On startup (and with jittered exponential backoff on disconnect), each `squalld` pod dials `squall`'s management-cluster Internal L4 LoadBalancer VIP using `purser/client` (`client.NewPKI` or federated `client.NewSPIFFE` with `CertificateFileSource` + `RootCAsSource` hot-reload) and opens `NodeAgentService.Connect(stream AgentEvent) returns (stream ControllerCommand)`. Each target cluster's `squalld` client certificate encodes its `cluster_id` in its SAN (`DNS: <cluster_id>.squalld.internal` or SPIFFE path `/cluster/<cluster_id>`), and `squall`'s `purser/authn/mtls` server rejects any `AgentHello{cluster_id, node_name, boot_id, live_leases, tombstones}` whose `cluster_id` does not match the verified mTLS certificate SAN (preventing a compromised dev cluster from spoofing a staging or production cluster on the hub) or that collides with an already-live stream for `(cluster_id, node_name)`. Because `squalld` applies `netem` and `nftables` inside the *victim pod's* `/proc/<pid>/ns/net`, `squalld`'s own pod network namespace and outbound gRPC stream remain unaffected by arena network faults.
+2. **Per-command Ed25519 lease envelope:** `purser` authenticates the gRPC stream endpoints rather than individual fault leases. Exclusively inside `squall`'s `pkg/executor` — after `(cluster_id, arena)` safety checks pass — the executor signs every `ControllerCommand` pushed down the stream with an Ed25519 private key (`crypto/ed25519`; public key mounted read-only in `squalld`):
    `{command_nonce, fault_id, cluster_id, node_name, target_pod_uid, target_container_id, action, spec_sha256, issued_at, lease_expires_at}`.
    `squalld` verifies the Ed25519 signature, confirms `cluster_id` and `node_name` match its own identity, rejects expired or >30s clock-skewed `issued_at` envelopes, enforces a bounded max TTL ceiling, and tracks seen `command_nonce`s in a time-bounded anti-replay ring (allowing signed `Probe` and idempotent `Clear` commands for an active `fault_id`).
 
@@ -260,7 +263,7 @@ Without mounting containerd's CRI socket, `squalld` locates target containers de
 `squalld` guarantees bounded fault lifetime even under total control-plane loss:
 1. **Write-ahead `tmpfs` lease:** Before mutating a netns or cgroup, `squalld` atomically writes `/run/squalld/leases/<fault_id>.json` (`{fault_id, pod_uid, netns_inode, burner_pid, action, lease_expires_at}`) and arms an in-process monotonic deadline timer. When the timer fires, `squalld` reverts the fault (and kills any `burner_pid`) and moves the record to a bounded tombstone ring (`/run/squalld/tombstones/`).
 2. **Kernel-enforced `nftables` positive lease-gate set timeout:** Every `inet squall_<fault_id>` table declares a scalar lease-gate set (`type nf_proto; flags timeout`) populated with `{ ipv4 timeout <ttl>s, ipv6 timeout <ttl>s }`, and every drop rule in the table matches `meta nfproto @lease_live` as its first expression (rather than attaching timeouts directly to CIDR interval or negated exemption sets, which either hit `nf_tables` `interval+timeout` constraints or invert `!= @exempt` rules into a 100% blackhole on expiry). When `<ttl>` elapses, the Linux kernel (`nf_tables`) expires `@lease_live` automatically — disarming every rule in the table on time even if **both** `squall` and `squalld` are `SIGKILL`ed and never restart.
-3. **Crash recovery & `ListLive` reconciliation:** On `squalld` startup (after a daemon restart or upgrade), `squalld` reads `/run/squalld/leases/`, immediately reverts expired leases, re-arms timers for active leases, and sweeps any `squall_*` nftables tables or `netem` qdiscs lacking a live lease. `squall`'s driver queries signed `ListLive` across all `squalld` pods to adopt active leases on controller restart and drains tombstones so `pkg/audit` distinguishes `cleared`, `agent-self-reverted`, and `orphan-reaped`.
+3. **Crash recovery & push-first `AgentHello` reconciliation:** On `squalld` startup (after a daemon restart or upgrade), `squalld` reads `/run/squalld/leases/`, immediately reverts expired leases, re-arms timers for active leases, and sweeps any `squall_*` nftables tables or `netem` qdiscs lacking a live lease. Whenever `squalld` connects or reconnects its outbound gRPC stream (`#NODE-2`), its opening `AgentHello` frame pushes `{live_leases, tombstones}` directly to `squall`, enabling immediate lease adoption across engine restarts and draining tombstones so `pkg/audit` distinguishes `cleared`, `agent-self-reverted`, and `orphan-reaped`.
 
 ### Emit parameter-free logs and execute timed efficacy probes in-cluster {#NODE-6}
 
@@ -272,32 +275,33 @@ To pass `T5` (`#LEAK-2`) even if an investigator holds cluster-wide `pods/log` a
 
 ### Define one protobuf Engine contract with asynchronous submission and structured dry-run {#API-1}
 
-`api/squall/v1/engine.proto` defines a single canonical contract served over gRPC and Connect/HTTP JSON, protected by `purser` (`v0.5.0`) `httpmw.Chain`, `httpmw.CheckBind`, `authn/{oidc,mtls,bearer}`, and `authz.Authorize` (recording `purser.Caller.Identity` in every audit entry):
+`api/squall/v1/engine.proto` defines a single canonical multi-cluster contract served over gRPC and Connect/HTTP JSON, protected by `purser` (`v0.5.0`) `httpmw.Chain`, `httpmw.CheckBind`, `authn/{oidc,mtls,bearer}`, and `authz.Authorize` (recording `purser.Caller.Identity` in every audit entry). Every arena-scoped request carries `(cluster_id, arena)` explicitly:
 
-- **`InspectArena`** *(read-only)*: Returns arena topology, workload readiness, steady-state baseline, active leases, cooldown timers, and per-kind historical detection/diagnosis stats.
-- **`DryRunFault`** *(read-only)*: Runs `validate -> safety -> narrow -> precheck` without mutating state, returning resolved target pods and structured machine-readable refusal codes (e.g., `ARENA_NOT_ENABLED`, `COOLDOWN_ACTIVE`, `BLAST_RADIUS_EXCEEDED`, `NODE_TIER_DISABLED`, `STEADY_STATE_UNHEALTHY`) so callers and LLMs self-correct deterministically.
-- **`SubmitFault`** *(mutating, asynchronous)*: Reserves the safety lease, executes `Apply`, and returns `{fault_id, lease_expires_at, stage: "INJECTING"}` immediately — never blocking on multi-minute settle gates.
+- **`ListClusters`** *(read-only)*: Lists registered target `cluster_id`s, opt-in arenas per cluster, connected `squalld` node-stream counts, and `node` tier eligibility.
+- **`InspectArena`** *(read-only)*: Returns `(cluster_id, arena)` topology, workload readiness, steady-state baseline, active leases, cooldown timers, and per-kind historical detection/diagnosis stats.
+- **`DryRunFault`** *(read-only)*: Runs `validate -> safety -> narrow -> precheck` on `(cluster_id, arena)` without mutating state, returning resolved target pods, `squalld` stream readiness on the target nodes, and structured machine-readable refusal codes (e.g., `CLUSTER_UNKNOWN`, `ARENA_NOT_ENABLED`, `NODE_AGENT_DISCONNECTED`, `COOLDOWN_ACTIVE`, `BLAST_RADIUS_EXCEEDED`, `NODE_TIER_DISABLED`, `STEADY_STATE_UNHEALTHY`) so callers and LLMs self-correct deterministically.
+- **`SubmitFault`** *(mutating, asynchronous)*: Reserves the `(cluster_id, arena)` safety lease, pushes `Apply`, and returns `{fault_id, cluster_id, lease_expires_at, stage: "INJECTING"}` immediately — never blocking on multi-minute settle gates.
 - **`WaitFault` / `StreamFault`** *(read-only)*: Streams or blocks until a requested lifecycle stage (`CONFIRMED`, `SETTLED`, `CLEARED`, `RECOVERED`) with caller-controlled timeout.
-- **`ObserveArena`** *(read-only)*: Queries live pod states, efficacy probes (via `squalld`), and `k8s-lookout` incident correlation hooks during an active fault or cascade.
+- **`ObserveArena`** *(read-only)*: Queries live pod states, efficacy probes (via `squalld`), and `k8s-lookout` incident correlation hooks for `(cluster_id, arena)` during an active fault or cascade.
 - **`ClearFault`** *(mutating, idempotent)*: Immediately triggers `Clear` and recovery verification before lease expiry.
 
 ### Enforce heartbeated, budgeted sessions for multi-step scenarios {#API-2}
 
 Multi-step chaos scenarios — such as injecting backend latency, observing retry amplification, then killing one replica if queue depth crosses a threshold — open an explicit **`ScenarioSession`** (`OpenSession`, `HeartbeatSession`, `CloseSession`):
-- `OpenSession` validates and pins `{campaign_id, arena, max_concurrent_faults, max_total_faults, max_fault_ttl, session_deadline, heartbeat_ttl}` (default `heartbeat_ttl: 30s`) and mints an ephemeral session-scoped bearer token.
-- Every `SubmitFault` carrying that session token is accounted against the session's concurrency and total-fault budgets and clamped to `min(requested_ttl, max_fault_ttl, session_deadline - now)`.
+- `OpenSession` validates and pins `{campaign_id, allowed_targets: [(cluster_id, arena), ...], max_concurrent_faults, max_total_faults, max_fault_ttl, session_deadline, heartbeat_ttl}` (default `heartbeat_ttl: 30s`) and mints an ephemeral session-scoped bearer token.
+- Every `SubmitFault` carrying that session token must match one of the session's `allowed_targets`, is accounted against the session's concurrency and total-fault budgets, and is clamped to `min(requested_ttl, max_fault_ttl, session_deadline - now)`.
 - If the scenario program panics, hangs, is killed by its sandbox timeout, or misses `heartbeat_ttl`, `squall` automatically marks the session aborted and immediately `Clear`s every live fault tied to the session.
 
 ### Expose MCP tools and generated Go and Python SDKs from the same Engine API {#API-3}
 
 Both agent tool calls and imperative scenario programs consume `squall/v1`:
-1. **MCP server (`pkg/mcpserver`):** Wraps `squall/v1` over MCP Streamable HTTP and `stdio`, marking `InspectArena`, `DryRunFault`, `WaitFault`, and `ObserveArena` with `ReadOnlyHint: true` so `core-agent` dispatches inspection calls concurrently and gates only `SubmitFault`, `ClearFault`, and `RunScenario`.
+1. **MCP server (`pkg/mcpserver`):** Wraps `squall/v1` over MCP Streamable HTTP and `stdio`, marking `ListClusters`, `InspectArena`, `DryRunFault`, `WaitFault`, and `ObserveArena` with `ReadOnlyHint: true` so `core-agent` dispatches inspection calls concurrently and gates only `SubmitFault`, `ClearFault`, and `RunScenario`.
 2. **Go SDK (`pkg/sdk`) and Python SDK (`sdk/python/squall_sdk`):** Idiomatic, context-aware clients over `squall/v1` with automatic background session heartbeating (`sess.HeartbeatLoop(ctx)`) and `defer sess.Close()` cleanup helpers so an agent can author 30-line adaptive Go or Python programs that compose faults, probes, and conditional branches safely.
 
 ### Separate engine-verified ground truth from agent-claimed provenance in the audit trail {#API-4}
 
 Every JSONL record in `pkg/audit` strictly separates two top-level sub-documents:
-- **`ground_truth`** *(written exclusively by `pkg/executor`)*: `fault_id`, `session_id`, `caller_identity`, `engine`, `kind`, `arena`, exact resolved target coordinates (`namespace`, `workload`, `pod_uids`, `nodes`), `injected_at`, `confirmed_at`, `cleared_at`, `recovered_at`, `clear_reason` (`explicit`, `ttl-expired`, `session-aborted`, `agent-self-reverted`, `orphan-reaped`), and raw precheck/confirm/recovery probe measurements.
+- **`ground_truth`** *(written exclusively by `pkg/executor`)*: `fault_id`, `session_id`, `caller_identity`, `cluster_id`, `engine`, `kind`, `arena`, exact resolved target coordinates (`namespace`, `workload`, `pod_uids`, `nodes`), `injected_at`, `confirmed_at`, `cleared_at`, `recovered_at`, `clear_reason` (`explicit`, `ttl-expired`, `session-aborted`, `agent-self-reverted`, `orphan-reaped`), and raw precheck/confirm/recovery probe measurements.
 - **`claims`** *(optional metadata supplied by `squall-agent` or scenario code)*: `hypothesis`, `scenario_name`, `expected_lookout_signals`, and `expected_root_cause`.
 
 Evaluation judges (`shipmind scenario judge` and `squall eval`) score SRE agents strictly against `ground_truth` and refuse to grade faults where `ground_truth.confirmed` is `false`.
@@ -355,7 +359,7 @@ Evaluation campaigns and `squall-agent`'s planner treat observability detection 
 
 ### Open risks
 
-1. **Unverified kernel/OS details on GKE COS + Dataplane V2:** While `tc netem` was proven live in the 2026-11-19 GKE spike, pure-Go `nf_tables` netlink set-element kernel timeouts on Container-Optimized OS (COS), cgroup v2 path layout under GKE's systemd cgroup driver, `appArmorProfile.type: Unconfined` with the 4-capability profile, and `pods/portforward` L4 mTLS stream multiplexing to `squalld` on private clusters require an immediate M1 validation spike on GKE.
+1. **Unverified kernel/OS details on GKE COS + Dataplane V2:** While `tc netem` was proven live in the 2026-11-19 GKE spike, pure-Go `nf_tables` netlink set-element kernel timeouts on Container-Optimized OS (COS), cgroup v2 path layout under GKE's systemd cgroup driver, `appArmorProfile.type: Unconfined` with the 4-capability profile, and outbound bi-directional gRPC stream reconnect behavior across Internal L4 LoadBalancer leader failovers require an immediate M1 validation spike on GKE.
 2. **`netem` has no kernel-level TTL:** Unlike `nftables` sets (which expire in the kernel even if `squalld` dies), Linux `tc netem` has no built-in kernel timeout. If `squalld` is `SIGKILL`ed *and* Kubernetes cannot restart the `squalld` DaemonSet pod on that node, an active `netem` qdisc persists until `squalld` restarts or the victim pod is recreated.
 3. **Ed25519 signing key blast radius:** Because `squalld` holds no Kubernetes API token (`#NODE-1`), it cannot independently query namespace annotations to verify arena membership. Compromise of the off-cluster Ed25519 private key + mTLS client identity allows fault injection against any pod on nodes running `squalld`. Mitigation: keep the private key off-cluster in memory/KMS, scope `squalld` `nodeSelector` to non-system/arena node pools where possible, and rotate short-lived signing keys.
 4. **Privileged DaemonSet review surface:** `hostPID` plus `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and `CAP_KILL` is root-equivalent on worker nodes running `squalld`. Dropping the CRI socket and API token narrows lateral movement, and dedicated node-pool scheduling isolates control-plane and production tenants.

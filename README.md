@@ -19,8 +19,9 @@ diagnosis.
   Kubernetes `pods delete`. Network delay, packet loss, L3/L4 partition,
   container kill, and CPU/memory pressure run through `squalld` — a node
   DaemonSet (`hostPID`, four capabilities, no container runtime socket, no
-  Kubernetes API token) driven from outside the target cluster via `purser`
-  mTLS and Ed25519-signed command leases.
+  Kubernetes API token, zero listening ports) that connects outbound over
+  bi-directional gRPC + `purser` mTLS to a multi-cluster `squall` management
+  plane and executes Ed25519-signed command leases.
 - **Self-reverting by construction:** Every fault carries a lease deadline.
   `squalld` persists active leases on node-local `tmpfs`, arms a local revert
   timer, and backs network partitions with `nftables` kernel set timeouts so

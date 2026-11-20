@@ -34,18 +34,27 @@ socket, and print full fault parameters to stdout (`pods/log`). `squalld`
 enforces node-local `tmpfs` lease timers, `nftables` kernel set timeouts, and
 parameter-free logs.
 
-## 2026-11-20 — Leak bar measured at wildcard-read RBAC (`R`), controller outside target cluster
+## 2026-11-20 — Leak bar measured at wildcard-read RBAC (`R`), multi-cluster external engine + outbound `squalld` gRPC streams
 
 **Decision:** Hold runtime fault injection to `K = 0` (no fault kind or target)
 and `F = 0` (no fault parameters) against an investigator with read access to
-every Kubernetes resource kind (`R`), and run the `squall` engine outside the
-target cluster.
+every Kubernetes resource kind (`R`). Run one `squall` management plane outside
+the target clusters (keying safety gates, leases, sessions, and audit records on
+`(cluster_id, arena)` across 1..N target clusters), and have `squalld` initiate
+outbound bi-directional gRPC streams (`purser` mTLS with `cluster_id`-bound
+client certs + Ed25519 command leases) into `squall`'s single Internal L4
+LoadBalancer rather than exposing inbound ports or Services in target clusters.
 
 **Why:** In the 2026-11-19 `shipmind-stage` benchmark (27 faults, 12 detected,
 5 correct diagnoses), 3 of the 5 correct diagnoses were contaminated by Chaos
 Mesh leaks — and in every leaked session, the agent discovered the fault via
 ordinary core `v1` `Event` listings before querying any `chaos-mesh.org` object.
 Scoping RBAC to hide custom resources does not hide Events or `pods/log`.
+Having `squalld` dial outbound eliminates all listening sockets and LoadBalancers
+in target clusters (closing `pods/proxy` and lateral pod scraping completely),
+solves per-node DaemonSet routing without L4 peer-relay hops, and allows one
+`squall` control plane to manage multiple target clusters across overlapping
+VPC/Pod CIDRs from day one.
 
 ## 2026-11-20 — Build `squall-agent` on `core-agent/v3` + `core-models`, never `mast` or Yaegi
 
